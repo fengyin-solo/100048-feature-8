@@ -18,6 +18,21 @@
       </article>
     </div>
 
+    <section class="report-bar">
+      <div class="report-head">
+        <strong>达标率报表导出</strong>
+        <span class="report-desc">按周期汇总出水流量、化学需氧量、总磷浓度等指标的达标判定，导出该周期超标清单</span>
+      </div>
+      <label class="filter-item">
+        <span>统计周期</span>
+        <input v-model="reportPeriod" type="month" />
+      </label>
+      <button class="btn primary" type="button" :disabled="reportExporting" @click="exportComplianceReport">
+        {{ reportExporting ? '正在导出…' : '导出超标清单' }}
+      </button>
+      <span v-if="reportMessage" class="report-message" :class="{ 'error-text': reportFailed }">{{ reportMessage }}</span>
+    </section>
+
     <form class="filter-bar" @submit.prevent="reload">
       <label v-for="field in filterFields" :key="field" class="filter-item">
         <span>{{ field }}</span>
@@ -63,7 +78,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { onMounted, ref, watch } from 'vue'
 
 import { request } from '@/api/client'
 
@@ -80,6 +95,64 @@ const total = ref(0)
 const errorMessage = ref('')
 const filters = ref<Record<string, string>>({})
 const filterFields = columns.slice(0, 3)
+
+// 达标率报表导出：周期选择持久化到 localStorage，导出下载后不清空，刷新后保持原样
+const REPORT_PERIOD_KEY = 'effluent:compliance:period'
+const reportPeriod = ref('')
+const reportMessage = ref('')
+const reportFailed = ref(false)
+const reportExporting = ref(false)
+
+watch(reportPeriod, (value) => {
+  if (value) {
+    localStorage.setItem(REPORT_PERIOD_KEY, value)
+  } else {
+    localStorage.removeItem(REPORT_PERIOD_KEY)
+  }
+})
+
+async function exportComplianceReport() {
+  reportMessage.value = ''
+  reportFailed.value = false
+  if (!reportPeriod.value) {
+    reportFailed.value = true
+    reportMessage.value = '请先选择统计周期，再导出达标率报表'
+    return
+  }
+  reportExporting.value = true
+  try {
+    const response = await request(`${ENDPOINT}/compliance/export?period=${encodeURIComponent(reportPeriod.value)}`)
+    if (!response.ok) {
+      // 无数据周期、重复导出等兜底说明由后端 detail 带回来，原样展示
+      let detail = ''
+      try {
+        const payload = await response.json()
+        detail = typeof payload?.detail === 'string' ? payload.detail : ''
+      } catch {
+        detail = ''
+      }
+      reportFailed.value = true
+      reportMessage.value = detail || `达标率报表导出失败（接口返回 ${response.status}），请稍后重试`
+      return
+    }
+    const blob = await response.blob()
+    const disposition = response.headers.get('Content-Disposition') ?? ''
+    const matched = disposition.match(/filename\*=UTF-8''([^;]+)/)
+    const filename = matched ? decodeURIComponent(matched[1]) : `出水达标率报表_${reportPeriod.value}.csv`
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = filename
+    link.click()
+    URL.revokeObjectURL(url)
+    reportMessage.value = `周期 ${reportPeriod.value} 的达标率报表已导出下载，周期选择已保留`
+  } catch (error) {
+    reportFailed.value = true
+    reportMessage.value = error instanceof Error ? `达标率报表导出失败：${error.message}` : '达标率报表导出失败，请稍后重试'
+  } finally {
+    reportExporting.value = false
+  }
+}
 
 function resetFilters() {
   filters.value = {}
@@ -126,5 +199,8 @@ async function reload() {
   }
 }
 
-onMounted(reload)
+onMounted(() => {
+  reportPeriod.value = localStorage.getItem(REPORT_PERIOD_KEY) ?? ''
+  void reload()
+})
 </script>

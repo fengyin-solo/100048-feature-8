@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import quote
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Response
 
 from app.schemas import ActionResult, EntryPayload, PageResult
 from app.services.effluent import EffluentService
@@ -28,6 +29,24 @@ def list_entries(
         raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
     items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
     return PageResult(items=items, total=total, page=page, size=size)
+
+
+@router.get("/compliance/export")
+def export_compliance_report(period: str = Query(default="", description="统计周期，格式 YYYY-MM，如 2026-09")) -> Response:
+    """按周期导出出水达标率报表（CSV 下载）：汇总出水流量、化学需氧量、总磷浓度等指标的
+    达标判定结果并附超标清单。无数据周期、重复导出、周期格式错误都返回可读说明，不生成空文件。
+    路径用两段式，避免被上面的 /{entry_id} 抢占。"""
+    report, message, status_code = service.build_compliance_report(period.strip())
+    if report is None:
+        raise HTTPException(status_code=status_code, detail=message)
+    csv_text = service.render_compliance_csv(report)
+    filename = quote(f"出水达标率报表_{report['period']}.csv")
+    return Response(
+        # 带 BOM 的 UTF-8，保证 Excel 直接打开中文不乱码
+        content="\ufeff" + csv_text,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
+    )
 
 
 @router.get("/{entry_id}", response_model=dict)
