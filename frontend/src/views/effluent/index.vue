@@ -27,6 +27,25 @@
       <button class="btn ghost" type="button" @click="resetFilters">重置条件</button>
     </form>
 
+    <section class="report-panel">
+      <div class="report-head">
+        <h3>达标率报表导出</h3>
+        <p class="report-desc">按统计周期汇总出水流量、化学需氧量、总磷浓度等指标的达标判定结果，并将超标清单导出为 CSV 文件下载。</p>
+      </div>
+      <div class="report-controls">
+        <label class="filter-item">
+          <span>统计周期</span>
+          <input v-model="reportPeriod" type="month" />
+        </label>
+        <button class="btn primary" type="button" :disabled="exporting" @click="exportReport">
+          {{ exporting ? '正在导出…' : '导出超标清单' }}
+        </button>
+        <span v-if="lastExportLabel" class="report-note">本周期最近导出：{{ lastExportLabel }}</span>
+      </div>
+      <p v-if="reportNotice" class="report-note report-message">{{ reportNotice }}</p>
+      <p v-if="reportError" class="error-text report-message">{{ reportError }}</p>
+    </section>
+
     <table class="data-table">
       <thead>
         <tr>
@@ -63,7 +82,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 
 import { request } from '@/api/client'
 
@@ -80,6 +99,124 @@ const total = ref(0)
 const errorMessage = ref('')
 const filters = ref<Record<string, string>>({})
 const filterFields = columns.slice(0, 3)
+
+// 达标率报表：所选周期与导出记录落在 localStorage，刷新或重新进入页面后仍然保持。
+const REPORT_PERIOD_KEY = 'effluent.report.period'
+const REPORT_EXPORTS_KEY = 'effluent.report.exports'
+const reportPeriod = ref(loadStoredPeriod())
+const exporting = ref(false)
+const reportNotice = ref('')
+const reportError = ref('')
+const exportLog = ref<Record<string, string>>(loadStoredExports())
+
+const lastExportLabel = computed(() =>
+  reportPeriod.value ? exportLog.value[reportPeriod.value] ?? '' : '',
+)
+
+function loadStoredPeriod(): string {
+  try {
+    return localStorage.getItem(REPORT_PERIOD_KEY) ?? ''
+  } catch {
+    return ''
+  }
+}
+
+function loadStoredExports(): Record<string, string> {
+  try {
+    return JSON.parse(localStorage.getItem(REPORT_EXPORTS_KEY) ?? '{}') as Record<string, string>
+  } catch {
+    return {}
+  }
+}
+
+watch(reportPeriod, (value) => {
+  try {
+    if (value) {
+      localStorage.setItem(REPORT_PERIOD_KEY, value)
+    } else {
+      localStorage.removeItem(REPORT_PERIOD_KEY)
+    }
+  } catch {
+    // 隐私模式等场景下 localStorage 不可用时，页面内的周期选择仍然可用
+  }
+})
+
+async function readErrorDetail(response: Response): Promise<string> {
+  try {
+    const payload = (await response.json()) as { detail?: unknown }
+    return typeof payload.detail === 'string' ? payload.detail : ''
+  } catch {
+    return ''
+  }
+}
+
+async function exportReport() {
+  reportNotice.value = ''
+  reportError.value = ''
+  const period = reportPeriod.value
+  if (!period) {
+    reportError.value = '请先选择要导出的统计周期，再执行导出'
+    return
+  }
+  const previousExport = exportLog.value[period]
+  exporting.value = true
+  try {
+    // 查询参数与页面条件保持一致：周期之外，监测编号筛选也一并带给后端。
+    const query = new URLSearchParams({ period })
+    const keyword = (filters.value['监测编号'] ?? '').trim()
+    if (keyword) {
+      query.set('keyword', keyword)
+    }
+    const response = await request(`${ENDPOINT}/compliance-report?${query.toString()}`)
+    if (response.status === 404) {
+      reportError.value = (await readErrorDetail(response))
+        || `周期 ${period} 内没有出水监测记录，未生成报表，请改选其它周期`
+      return
+    }
+    if (!response.ok) {
+      const detail = await readErrorDetail(response)
+      reportError.value = detail
+        ? `达标率报表导出失败：${detail}`
+        : '达标率报表导出失败，请稍后重试'
+      return
+    }
+    const blob = await response.blob()
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `出水达标率报表-${period}.csv`
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    URL.revokeObjectURL(url)
+
+    const exceededText = response.headers.get('X-Exceedance-Count')
+    const serverExportCount = Number(response.headers.get('X-Export-Count') ?? '0')
+    const exportedAt = new Date().toLocaleString('zh-CN', { hour12: false })
+    exportLog.value = { ...exportLog.value, [period]: exportedAt }
+    try {
+      localStorage.setItem(REPORT_EXPORTS_KEY, JSON.stringify(exportLog.value))
+    } catch {
+      // 导出记录只是兜底提示，落盘失败不影响已下载的文件
+    }
+
+    const notes: string[] = []
+    if (previousExport) {
+      notes.push(`周期 ${period} 已在 ${previousExport} 导出过，本次按最新数据重新生成`)
+    } else if (serverExportCount > 1) {
+      notes.push(`周期 ${period} 此前已导出过，本次按最新数据重新生成`)
+    }
+    const exceeded = Number(exceededText ?? '0')
+    notes.push(exceeded > 0
+      ? `报表已下载，含 ${exceeded} 条超标记录，所选周期已保留`
+      : '报表已下载，本周期无超标记录，所选周期已保留')
+    reportNotice.value = notes.join('；')
+  } catch {
+    reportError.value = '达标率报表导出失败，请检查网络连接或稍后重试'
+  } finally {
+    exporting.value = false
+  }
+}
 
 function resetFilters() {
   filters.value = {}
@@ -128,3 +265,13 @@ async function reload() {
 
 onMounted(reload)
 </script>
+
+<style scoped>
+.report-panel { background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+.report-head h3 { margin: 0 0 4px; font-size: 14px; }
+.report-desc { margin: 0 0 10px; font-size: 12px; color: var(--muted); }
+.report-controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+.report-controls input[type="month"] { padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; }
+.report-note { font-size: 12px; color: var(--muted); }
+.report-message { margin: 8px 0 0; }
+</style>
